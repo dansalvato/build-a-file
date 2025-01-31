@@ -1,32 +1,32 @@
-# Simple Binary Builder
+# Build-A-File
 
-Simple Binary Builder (SBB) is a framework that makes it easy to create custom binary file formats and assemble your data into them.
+Build-A-File (BAF) is a framework that makes it easy to create custom binary file formats and assemble your data into them.
 
-It was originally created to easily build binary data files for games targeting Amiga and other retro systems. However, SBB can be used for any general purpose. It was born as an internal-only tool, so it's a bit rough around the edges, but if you follow the rules then it gets the job done. :)
+It was originally created to easily build binary data files for games targeting Amiga and other retro systems. However, BAF can be used for any general purpose. It was born as an internal-only tool, so it's a bit rough around the edges, but if you follow the rules then it gets the job done. :)
 
-SBB is a one-way tool: It takes source data and builds it into a binary file. If you want to reverse-engineer existing binary files into an ORM, check out [Mr. Crowbar](https://github.com/moralrecordings/mrcrowbar), which inspired this project (and is probably much more well-written).
+BAF is a one-way tool: It takes source data and builds it into a binary file. If you want to reverse-engineer existing binary files into an ORM, check out [Mr. Crowbar](https://github.com/moralrecordings/mrcrowbar), which inspired this project (and is probably much more well-written).
 
 ## Requirements
 
-SBB requires Python 3.12 or higher.
+BAF requires Python 3.12 or higher.
 
 ## Examples
 
 ### Basic example
 
-With SBB, data structures are defined using `Block`s. Create a class that derives from `Block`, then annotate some property names, and a datatype for each property.
+With BAF, data structures are defined using `Block`s. Create a class that derives from `Block`, then annotate some property names, and a datatype for each property.
 
-In your TOML file, create some corresponding entries with the same names as your properties. When you load the TOML file to your `Block` class, SBB will automatically fill in all the properties with the data from the TOML file.
+In your TOML file, create some corresponding entries with the same names as your properties. When you load the TOML file to your `Block` class, BAF will automatically fill in all the properties with the data from the TOML file.
 
-Notice we have one property, `name_length`, that isn't in the TOML. That's because we want to programmatically give this a value, rather than define it in the TOML. To do this, create a setter method called `set_name_length()`. If SBB finds a setter method called `set_<property_name>`, it will use that to fill in the data with whatever value you return.
+Notice we have one property, `name_length`, that isn't in the TOML. That's because we want to programmatically give this a value, rather than define it in the TOML. To do this, create a setter method called `set_name_length()`. If BAF finds a setter method called `set_<property_name>`, it will use that to fill in the data with whatever value you return.
 
 Whatever data is given to the parent `Block` (in this case, the `dict` generated from our TOML file), that will also be passed to the setter method. So, if you need that data to determine your value, you can use it.
 
 `example.py`:
 
 ```py
-import sbb
-from sbb.datatypes import *
+import baf
+from baf.datatypes import *
 
 
 class Level(Block):
@@ -39,7 +39,7 @@ class Level(Block):
         return self.name.size()
 
 
-level = sbb.build_toml('example.toml', Level)
+level = baf.build_toml('example.toml', Level)
 level_bytes = level.to_bytes()
 print(level_bytes.hex())
 # Write file to disk
@@ -68,7 +68,7 @@ You can nest `Block`s to create more complex data structures.
 
 In this example, `Level` has two properties, `header` and `data`, which are each a `Block` of their own. The TOML file reflects this.
 
-Remember that we're passing `Level` to `sbb.build_toml()`, which is how `Level` is specified as the top-level block.
+Remember that we're passing `Level` to `baf.build_toml()`, which is how `Level` is specified as the top-level block.
 
 ```py
 class LevelHeader(Block):
@@ -110,7 +110,7 @@ height = 128
 
 In the above example, you'll notice that `name_length` is set using `self.name.size()`, and `data_offset` is set using `self.data.offset()`. These two functions work on any datatype, and you can use them in your setter without worrying about the order in which data is built.
 
-Behind the scenes, SBB uses some aggressive reflection to figure out which properties have dependencies on others. For example, to figure out `data_offset`, SBB needs to know the size of `header`, so it builds `header` first. If there is a circular dependency, you will get an error.
+Behind the scenes, BAF uses some aggressive reflection to figure out which properties have dependencies on others. For example, to figure out `data_offset`, BAF needs to know the size of `header`, so it builds `header` first. If there is a circular dependency, you will get an error.
 
 ### `Array`
 
@@ -156,11 +156,11 @@ spawn_y = 56
 
 ### Visualizer
 
-After getting our `Level` object with `sbb.build_toml()`, we can use `sbb.visualize()` to view a tree of our file format.
+After getting our `Level` object with `baf.build_toml()`, we can use `baf.visualize()` to view a tree of our file format.
 
 ```py
-level = sbb.build_toml('visualizer_example.toml', Level)
-tree = sbb.visualize(level)
+level = baf.build_toml('visualizer_example.toml', Level)
+tree = baf.visualize(level)
 print(tree)
 ```
 
@@ -266,9 +266,9 @@ background_path = "images/background.png"
 
 ### Custom datatypes
 
-You can build on top of SBB with custom datatypes that suit your purposes.
+You can build on top of BAF with custom datatypes that suit your purposes.
 
-For example, SBB doesn't have a built-in `Bool` datatype because `bool` can have different implementations depending on the platform. It's easy to define your own.
+For example, BAF doesn't have a built-in `Bool` datatype because `bool` can have different implementations depending on the platform. It's easy to define your own.
 
 ```py
 class Bool(U8):
@@ -291,7 +291,7 @@ has_boss = true
 
 Below is an example of a custom `List` datatype which combines item count, item offsets, and item data.
 
-SBB ignores the annotations in the base `List` class—it only cares about those in the derived `Rooms` and `Spritesheets` classes. Notice how `items` contains a different `Array` type in `Rooms` and `Spritesheets`.
+BAF ignores the annotations in the base `List` class—it only cares about those in the derived `Rooms` and `Spritesheets` classes. Notice how `items` contains a different `Array` type in `Rooms` and `Spritesheets`.
 
 ```py
 class List(Block):
@@ -329,7 +329,7 @@ class Spritesheets(List):
 
 ### Overriding `__init__()`
 
-You can override `__init__()` if you need to do something highly specific with your data that SBB can't handle automatically. Fill in whatever data you want manually, and then call `super().__init__(parent, data)` at the end (don't forget this step). SBB will kick in and build any remaining data based on your TOML.
+You can override `__init__()` if you need to do something highly specific with your data that BAF can't handle automatically. Fill in whatever data you want manually, and then call `super().__init__(parent, data)` at the end (don't forget this step). BAF will kick in and build any remaining data based on your TOML.
 
 Below, I have a list `Bobs`, but the data in the TOML needs to be processed into a more specific format before the list can be built.
 
@@ -369,18 +369,18 @@ heights = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 
 ### Errors
 
-If SBB catches an exception, it will add notes to the exception containing a traceback of your data structures, so you can pinpoint what data or setter caused the issue.
+If BAF catches an exception, it will add notes to the exception containing a traceback of your data structures, so you can pinpoint what data or setter caused the issue.
 
-SBB doesn't discard or sanitize the full Python traceback, so it's ugly by default. If you want it to look nice, catch the exception yourself and print `__notes__`, as shown below. However, the default Python exception will also show the notes at the bottom, so this is optional.
+BAF doesn't discard or sanitize the full Python traceback, so it's ugly by default. If you want it to look nice, catch the exception yourself and print `__notes__`, as shown below. However, the default Python exception will also show the notes at the bottom, so this is optional.
 
 ```py
 import sys
-import sbb
-from sbb.errors import BuildError
+import baf
+from baf.errors import BuildError
 
 
 try:
-    level = sbb.build_toml('error_example.toml', Level)
+    level = baf.build_toml('error_example.toml', Level)
 except BuildError as e:
     print(f"ERROR: {e}\nTraceback:")
     print('\n'.join(e.__notes__))

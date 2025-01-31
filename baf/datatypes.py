@@ -25,7 +25,7 @@ RESERVED_NAMES = [
 
 
 class DataType(ABC):
-    '''The abstract base class of all SBB datatypes.'''
+    '''The abstract base class of all BAF datatypes.'''
 
     parent: Optional[Block]
 
@@ -254,7 +254,7 @@ class File(Bytes):
 class Empty(DataType):
     '''A datatype of size 0 that never generates any bytes in the output.
 
-    This can sometimes be useful in lieu of `None`, because SBB can parse
+    This can sometimes be useful in lieu of `None`, because BAF can parse
     it.'''
 
     def __init__(self, parent: Optional[Block]) -> None:
@@ -314,7 +314,7 @@ class Align[T: _Primitive](Bytes):
 
 class Block(DataType):
     '''The base class of custom datatypes and the foundational building block
-    of SBB.
+    of BAF.
 
     Custom datatypes deriving from `Block` can specify their data using member
     variable annotations, which are then automatically set using data from the
@@ -424,7 +424,7 @@ class Block(DataType):
         size or have already been populated with their data.
 
         It's preferable to directly call `offset()` on the child object,
-        especially in a setter method, because SBB can figure out the
+        especially in a setter method, because BAF can figure out the
         dependencies needed before the offset is calculated. However, this
         method can be useful in edge cases where `offset()` doesn't work.'''
 
