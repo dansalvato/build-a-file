@@ -1,585 +1,611 @@
 from __future__ import annotations
-import re
-import math
-import inspect
+import typing
+from typing import Any, ClassVar, Self, Sequence, TypeVar
+from collections.abc import Callable
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
-from types import UnionType
-from typing import Optional, Any, Callable, Sequence, ClassVar
+from dataclasses import dataclass
+import copy
 from pathlib import Path
-from .errors import DataMissingError, ValidationError, BuildError
+import baf
+from .errors import *
 
-RESERVED_NAMES = [
-    'offset',
-    'global_offset',
-    'offset_of',
-    'child_level',
-    'parent_prop_name',
-    'size',
-    'bit_size',
-    'static_size',
-    'to_bytes',
-    'type_name',
-    'root_path',
-]
+class DatatypeBase[T: DatatypeBase](ABC):
+    """The abstract base class of all BAF datatypes."""
+
+    parent: Container | None = None
+    """The parent datum of this datum."""
+    _is_instance: bool = False
+    """Whether this is an instantiated datum (if not, it is a model)."""
+    _is_built: bool = False
+    """Whether this datum has been built."""
+    _generic_type: T | None = None
+
+    @property
+    def root_datum(self) -> DatatypeBase:
+        """Gets the root datum of the tree this datum belongs to."""
+
+        if (parent := self.parent) is None:
+            return self
+        while parent.parent is not None:
+            parent = parent.parent
+        return parent
+
+    def build(self, data: Any, /) -> None:
+        """Builds this datum with the provided data."""
+
+        if not self._is_instance:
+            raise BuildError("Attempted to build a non-instantiated model")
+        if self._is_built:
+            raise BuildError("Attempted to build an already-built datum")
+        self._is_built = True
+        self._build(data)
+
+    @abstractmethod
+    def _build(self, data: Any, /) -> None:
+        ...
+
+    def get_bytes(self) -> bytes:
+        """Outputs this datum in its final form of raw bytes."""
+        if not self._is_instance:
+            raise BuildError("Attempted to get bytes from a non-instantiated model")
+        if not self._is_built:
+            raise BuildError("Attempted to get bytes from a datum that has not yet been built")
+        return self._get_bytes()
+
+    @abstractmethod
+    def _get_bytes(self) -> bytes:
+        ...
+
+    @abstractmethod
+    def size(self) -> int:
+        """Gets the total size, in bytes, of this datum."""
+        ...
+
+    def offset(self) -> int:
+        """Gets the offset, in bytes, of this datum, relative to its parent. If
+           the parent is None (i.e. this is the root), the offset is 0."""
+
+        if self.parent is None:
+            return 0
+        return self.parent.offset_of(self)
+
+    def instantiate(self, parent: Container | None) -> Self:
+        """Instantiates a datum from this model."""
+
+        if self._is_built:
+            raise BuildError("Attempted to instantiate from a datum that is building or already built")
+        datum = copy.copy(self)
+        if orig := getattr(datum, '__orig_class__', None):
+            datum._generic_type = typing.get_args(orig)[0]
+        # If type argument is TypeVar (T), we're inheriting from a generic
+        # parent, so get that type instead
+        if type(datum._generic_type) is TypeVar:
+            if parent is None:
+                raise InternalError("Datum with TypeVar does not have a parent")
+            datum._generic_type = parent._generic_type
+        datum.parent = parent
+        datum._is_instance = True
+        return datum
 
 
-class DataType(ABC):
-    '''The abstract base class of all BAF datatypes.'''
+class Datatype[T](DatatypeBase, ABC):
+    """The base class for standard datatypes that are built from input data."""
 
-    parent: Optional[Block]
+    _default_value: T | None = None
 
-    def __init__(self, parent: Optional[Block]) -> None:
-        self.parent = parent
-        self._validate()
+    def __init__(self, *, default: T | None = None) -> None:
+        self._default_value = default
 
-    def offset(self, parent_level: int = 0) -> int:
-        '''Gets the offset (in bytes) of this data in the parent.
+    @abstractmethod
+    def _process(self, data: Any) -> None:
+        ...
 
-        The `parent_level` parameter can be used to get an offset relative
-        to multiple parents up, but dependencies cannot be fully resolved for
-        that situation, so it can fail if the parents are not yet fully
-        built.'''
+    def _build(self, data: Any) -> None:
+        data = self.preprocess(data)
+        data = self._preprocess(data)
+        self._process(data)
 
+    def _preprocess(self, data: Any) -> Any:
+        return data
+
+    def preprocess(self, data: Any) -> Any:
+        return data
+
+
+class GenDatatype(DatatypeBase, ABC):
+    """The base class for datatypes that generate their own data when built,
+       without the need for input data."""
+
+    def _build(self, _: None = None) -> None:
+        self.preprocess()
+        self._preprocess()
+        self._process()
+
+    def _preprocess(self) -> None:
+        pass
+
+    def preprocess(self) -> None:
+        pass
+
+    def _process(self) -> None:
+        pass
+
+
+class Container[T](Datatype, ABC):
+    """The base class for datatypes that hold a collection of other datatypes.
+       Their output is the combined output of all datums in their
+       collection."""
+
+    def __init__(self, *, default: T | None = None) -> None:
+        super().__init__(default=default)
+
+    @abstractmethod
+    def get_items(self, default_if_missing: bool = False) -> Sequence[DatatypeBase]:
+        """Gets all the datums, in order, in this container. If
+           default_if_missing is False, this will fail if the Container is not
+           yet fully built. If default_if_missing is True, the output will
+           include default instantiated datums for any models that have not yet
+           been instantiated (allowing you to retrieve statically-known
+           information about the models)."""
+        ...
+
+    def size(self) -> int:
+        return sum(item.size() for item in self.get_items(True))
+
+    def offset_of(self, target: DatatypeBase) -> int:
         offset = 0
-        if parent_level > 0 and self.parent:
-            offset = self.parent.offset(parent_level - 1)
-        if isinstance(self.parent, Array):
-            offset += self._offset_in_parent_array(self.parent)
-        elif isinstance(self.parent, Block):
-            offset += self._offset_in_parent_block(self.parent)
-        return offset
-
-    def _offset_in_parent_array(self, parent: Array) -> int:
-        offset = 0
-        for elem in parent:
-            if elem is self:
-                break
-            offset += elem.size()
-        return offset
-
-    def _offset_in_parent_block(self, parent: Block) -> int:
-        offset = 0
-        for name, datatype in inspect.get_annotations(type(parent), eval_str=True).items():
-            attr = getattr(parent, name, datatype)
-            if attr is self:
+        for item in self.get_items(True):
+            if item is target:
                 return offset
-            if type(attr) is _Missing:
-                attr = datatype
-            offset += attr.size()
-        raise DataMissingError("Could not find self in parent attributes")
+            offset += item.size()
+        raise InternalError("Could not find self in parent")
 
-    def global_offset(self) -> int:
-        '''Gets the absolute offset from the very beginning of the data tree or
-        file. This may fail if the parents are not yet fully built.'''
+    def _get_bytes(self) -> bytes:
+        return b''.join([item.get_bytes() for item in self.get_items()])
 
-        return self.offset() + self.parent.global_offset() if self.parent else 0
+    def _unpack_type(self, model: DatatypeBase, data: Any) -> tuple[DatatypeBase, Any]:
+        """The user can declare a field as a more generic type (e.g. Block) and
+           then submit the data as a tuple to resolve the final type of the
+           data. This checks for that tuple and updates the model if needed."""
+        if not self._is_packed_type(data):
+            return model, data
+        new_model = data[0]
+        # Ensure proposed datatype is a subclass of original model
+        if not isinstance(new_model, type(model)):
+            raise BuildError(f"Dynamically-resolved Datatype {type(new_model).__name__} is not a child of {type(model).__name__}")
+        return new_model, data[1]
 
-    def child_level(self) -> int:
-        '''Gets the depth of the current child from the root block.'''
-
-        return self.parent.child_level() + 1 if self.parent else 0
-
-    def parent_prop_name(self) -> str:
-        '''Attempts to get the property name of this child as defined in the
-        parent, or a string of the element number if the parent is an `Array`.
-        Returns an empty string if not applicable or unable.'''
-
-        parent = self.parent
-        if not parent:
-            return ''
-        if isinstance(parent, Array):
-            for i, elem in enumerate(parent):
-                if elem is self:
-                    return f'Element {i}'
-        else:
-            annotations = inspect.get_annotations(type(parent))
-            items = [(name, getattr(parent, name)) for name in annotations]
-            for name, item in items:
-                if item is self:
-                    return name
-        return ''
-
-    @abstractmethod
-    def _get_data(self) -> Any:
-        ...
-
-    @classmethod
-    @abstractmethod
-    def size(cls) -> int:
-        '''Gets the size (in bytes) of the data in this datatype. Usable as
-        either a class method or an instance method.'''
-        ...
-
-    @abstractmethod
-    def to_bytes(self) -> bytes:
-        '''Gets the raw bytes of the data in this datatype.'''
-        ...
-
-    @abstractmethod
-    def _validate(self) -> None:
-        ...
-
-    def type_name(self) -> str:
-        '''Gets the type name of the current datatype.
-
-        If an `Array`, attempts to return `"Array[type]"` if the array type can
-        be determined by the parent. If not, returns `"Array"`.'''
-
-        datatype = type(self)
-        if datatype.__name__ == 'Array' and self.parent:
-            annotations = inspect.get_annotations(type(self.parent))
-            for name, type_name in annotations.items():
-                if getattr(self.parent, name) is self:
-                    array_type = re.match(r'.*\[.*\.(.*)\]', str(type_name))
-                    if array_type:
-                        return f'Array[{array_type.group(1)}]'
-        return datatype.__name__
+    def _is_packed_type(self, data) -> bool:
+        # Looking for (SomeType, data)
+        if not isinstance(data, tuple) or len(data) != 2:
+            return False
+        proposed_model = data[0]
+        # Ensure our 2-item sequence is a proposed dynamic datatype
+        if not isinstance(proposed_model, DatatypeBase):
+            return False
+        return True
 
 
-class _Primitive(DataType, int):
-    '''The base class of primitive integer-based datatypes like `U8`, `U16`,
-    and `U32`.'''
+class _Primitive(Datatype[int], ABC):
+    """The base class of all primitive integer datatypes."""
 
-    bit_size: ClassVar[int]
-    _data: int
+    _bit_size: ClassVar[int]
+    _min: ClassVar[int]
+    _max: ClassVar[int]
+    _data: int | None = None
 
-    def __new__(cls, _: Optional[Block], data: int):
-        valid = False
-        try:
-            int(data)
-            valid = True
-        except ValueError:
-            pass
-        if not valid:
-            type_name = type(data).__name__
-            raise ValidationError(f"Expected int type, received {type_name}")
-        return super(_Primitive, cls).__new__(cls, data)
-
-    def __init__(self, parent: Optional[Block], data: int) -> None:
+    def _process(self, data: int) -> None:
         self._data = data
-        super().__init__(parent)
 
-    def _get_data(self) -> int:
-        return self._data
+    def _preprocess(self, data) -> int:
+        if type(data) is not int:
+            raise ValidationError(f"Expected int, received {type(data).__name__}")
+        if data < self._min or data > self._max:
+            raise ValidationError(f"Value {data} outside of {type(self).__name__} range, must be {self._min} to {self._max}")
+        return data
 
-    @classmethod
-    def size(cls) -> int:
-        return cls.bit_size // 8
+    def size(self) -> int:
+        return self._bit_size // 8
 
     @classmethod
     def static_size(cls) -> int:
-        return cls.bit_size // 8
+        """Gets the statically-known size of this class."""
 
-    def to_bytes(self) -> bytes:
+        return cls._bit_size // 8
+
+    def _get_bytes(self) -> bytes:
+        if self._data is None:
+            raise BuildError("Primitive does not yet have a value")
         return self._data.to_bytes(self.size(), signed=self._data < 0)
 
-    def _validate(self) -> None:
-        range_min = -int(math.pow(2, self.bit_size - 1))
-        range_max = int(math.pow(2, self.bit_size) - 1)
-        if self._data < range_min or self._data > range_max:
-            raise ValidationError(f"Value {self._data} outside of range, must be {range_min} to {range_max}")
-
-    def __repr__(self) -> str:
-        return f'{self._get_data()} ({hex(self._get_data())})'
+    def __int__(self) -> int:
+        if self._data is None:
+            raise DependencyError("Primitive does not yet have a value")
+        return self._data
 
 
 class U8(_Primitive):
-    '''The datatype representing an 8-bit integer. If a signed value is
-    provided, the two's compliment is generated.'''
-    bit_size: ClassVar[int] = 8
+    """Datatype for 8-bit unsigned integers. Supports int() conversion."""
+
+    _bit_size = 8
+    _min = 0
+    _max = 2 ** 8 - 1
 
 
 class U16(_Primitive):
-    '''The datatype representing a 16-bit integer. If a signed value is
-    provided, the two's compliment is generated.'''
-    bit_size: ClassVar[int] = 16
+    """Datatype for 16-bit unsigned integers. Supports int() conversion."""
+
+    _bit_size = 16
+    _min = 0
+    _max = 2 ** 16 - 1
 
 
 class U32(_Primitive):
-    '''The datatype representing a 32-bit integer. If a signed value is
-    provided, the two's compliment is generated.'''
-    bit_size: ClassVar[int] = 32
+    """Datatype for 32-bit unsigned integers. Supports int() conversion."""
+
+    _bit_size = 32
+    _min = 0
+    _max = 2 ** 32 - 1
 
 
-class Bytes(DataType):
-    '''A sequence of raw bytes.'''
+class S8(_Primitive):
+    """Datatype for 8-bit signed integers."""
+
+    _bit_size = 8
+    _min = -2 ** 8 // 2
+    _max = 2 ** 8 // 2 - 1
+
+
+class S16(_Primitive):
+    """Datatype for 16-bit signed integers. Supports int() conversion."""
+
+    _bit_size = 16
+    _min = -2 ** 16 // 2
+    _max = 2 ** 16 // 2 - 1
+
+
+class S32(_Primitive):
+    """Datatype for 32-bit signed integers. Supports int() conversion."""
+
+    _bit_size = 32
+    _min = -2 ** 32 // 2
+    _max = 2 ** 32 // 2 - 1
+
+
+class I8(_Primitive):
+    """Datatype for 8-bit integers which can ambiguously be signed or
+       unsigned. Supports int() conversion."""
+
+    _bit_size = 8
+    _min = S8._min
+    _max = U8._max
+
+
+class I16(_Primitive):
+    """Datatype for 16-bit integers which can ambiguously be signed or
+       unsigned. Supports int() conversion."""
+
+    _bit_size = 16
+    _min = S16._min
+    _max = U16._max
+
+
+class I32(_Primitive):
+    """Datatype for 32-bit integers which can ambiguously be signed or
+       unsigned. Supports int() conversion."""
+
+    _bit_size = 32
+    _min = S32._min
+    _max = U32._max
+
+
+class Bytes(Datatype[bytes]):
+    """Datatype for a sequence of raw bytes."""
+
+    _size: int | None = None
+    _data: bytes
+
+    def __init__(self, size: int | None = None, *, default: bytes | None = None) -> None:
+        self._size = size
+        super().__init__(default=default)
+
+    def _process(self, data: bytes) -> None:
+        self._data = data
+
+    def _preprocess(self, data) -> bytes:
+        if not isinstance(self._size, int | None):
+            raise SpecError(f"Bytes size parameter must be int; received {type(self._size).__name__}")
+        if type(data) is not bytes and type(data) is not bytearray:
+            raise ValidationError(f"Expected bytes type, received {type(data).__name__}")
+        if self._size is not None and len(data) != self._size:
+            raise ValidationError(f"Expected {self._size} bytes but data is {len(data)} bytes")
+        return bytes(data)
+
+    def size(self) -> int:
+        if self._size is not None:
+            return self._size
+        if not hasattr(self, '_data'):
+            raise DependencyError("Size of Bytes is not yet known")
+        return len(self._data)
+
+    def _get_bytes(self) -> bytes:
+        return self._data
+
+
+class File(Datatype[str]):
+    """Datatype that accepts a file path and outputs the raw bytes of that
+       file."""
 
     _data: bytes
 
-    def __init__(self, parent: Optional[Block], data: bytes = bytes(0)) -> None:
-        self.size = self._size
-        if isinstance(data, str):
-            data = data.encode('utf-8')
+    def _process(self, data: bytes) -> None:
         self._data = data
-        super().__init__(parent)
 
-    def _get_data(self) -> bytes:
-        return self._data
+    def _preprocess(self, data) -> bytes:
+        try:
+            path = Path(data)
+        except TypeError:
+            raise ValidationError(f"File datatype expected PathLike or str, received {type(data).__name__}")
+        if not path.is_absolute():
+            path = baf.root_path/path
+        if not Path.exists(path):
+            raise ValidationError(f"File does not exist: {path}")
+        with open(path, 'rb') as f:
+            return f.read()
 
-    @classmethod
-    def size(cls) -> int:
-        raise DataMissingError("Attempted to get size of a Bytes object before it was initialized")
-
-    def _size(self) -> int:
+    def size(self) -> int:
+        if not hasattr(self, '_data'):
+            raise DependencyError("Size of File is not yet known")
         return len(self._data)
 
-    def to_bytes(self) -> bytes:
+    def _get_bytes(self) -> bytes:
         return self._data
 
-    def _validate(self) -> None:
-        if not isinstance(self._data, (bytes, bytearray)):
-            type_name = type(self._data).__name__
-            raise ValidationError(f"Expected bytes type, received {type_name}")
+
+@dataclass
+class _BlockItem:
+    name: str
+    model: DatatypeBase
+    base_data: Any
+    data: Any = None
+    setter: Callable | None = None
+    setter_done: bool = False
+    done: bool = False
+
+    def build(self, parent: Block) -> None:
+        if self.setter and not self.setter_done:
+            self.data = self.setter(self.base_data)
+            self.setter_done = True
+        if isinstance(self.data, type(self.model)):
+            setattr(parent, self.name, self.data)
+            self.done = True
+            return
+        item_model, item_data = parent._unpack_type(self.model, self.data)
+        item = item_model.instantiate(parent)
+        setattr(parent, self.name, item)
+        item.build(item_data)
+        self.done = True
 
 
-class File(Bytes):
-    '''A datatype that extends `Bytes` to accept a file path that is either
-    absolute or relative to the location of your root file.
+class Block(Container[dict], ABC):
+    """The base class for most user-defined datatypes. It builds data based on
+       its class attributes."""
 
-    The file is read and inserted as raw bytes.'''
+    # Instantiate empty datatypes with a parent so offset() works more reliably
+    # in setters
+    def __init__(self, *, default: dict | None = None) -> None:
+        for name, model in self._fields().items():
+            setattr(self, name, model.instantiate(self))
+        super().__init__(default=default)
 
-    def __init__(self, parent: Optional[Block], path: str) -> None:
-        file_path = Path(path)
-        if not file_path.is_absolute() and parent and parent.root_path:
-            file_path = parent.root_path/file_path
-        try:
-            with open(file_path, 'rb') as f:
-                data = f.read()
-        except Exception as e:
-            raise BuildError(f"File read error: {file_path}") from e
-        super().__init__(parent, data)
-
-
-class Empty(DataType):
-    '''A datatype of size 0 that never generates any bytes in the output.
-
-    This can sometimes be useful in lieu of `None`, because BAF can parse
-    it.'''
-
-    def __init__(self, parent: Optional[Block]) -> None:
-        super().__init__(parent)
-
-    def _get_data(self) -> Any:
-        return None
+    def _process(self, data: dict) -> None:
+        blockitems = [_BlockItem(name, model, data) for name, model in self._fields().items()]
+        for item in blockitems:
+            item.setter = getattr(self, 'set_' + item.name, None)
+        for item in blockitems:
+            name, model = item.name, item.model
+            # Check if this field is in dict data
+            if name in data:
+                item.data = data[name]
+            # Check for default value
+            elif isinstance(model, Datatype) and model._default_value is not None:
+                item.data = model._default_value
+        # Build blocks until all dependencies are resolved
+        while any(not blockitem.done for blockitem in blockitems):
+            progress = False
+            for item in blockitems:
+                if item.done:
+                    continue
+                try:
+                    item.build(self)
+                except DependencyError:
+                    continue
+                except Exception as e:
+                    e.add_note(f'{type(self).__name__} -> {item.name}: {type(item.model).__name__}')
+                    raise
+                progress = True
+            # If nothing got resolved in a full pass, cyclical dependencies
+            if not progress:
+                raise BuildError("Could not resolve dependencies. Check for cyclical dependencies in: "
+                    f"{', '.join([item.name for item in blockitems if not item.done])}")
 
     @classmethod
-    def size(cls) -> int:
-        return 0
+    def _fields(cls) -> dict[str, DatatypeBase]:
+        return {k:v for (k, v) in cls.__dict__.items() if not k.startswith('_') and isinstance(v, DatatypeBase)}
+
+    def _preprocess(self, data) -> dict:
+        if type(data) is not dict:
+            raise ValidationError(f"Expected dict, received {type(data).__name__}")
+        for name, model in self._fields().items():
+            if isinstance(model, GenDatatype | Optional) or isinstance(model, Datatype) and model._default_value is not None:
+                continue
+            if name in data or hasattr(self, 'set_' + name):
+                continue
+            raise ValidationError(f"No setter or dict value found for {name}")
+        return data
+
+    def get_items(self, default_if_missing: bool = False) -> Sequence[DatatypeBase]:
+        if not default_if_missing:
+            return [getattr(self, name) for name in self._fields()]
+        return [getattr(self, name, default) for (name, default) in self._fields().items()]
+
+    def force_dependency(self, model: DatatypeBase) -> None:
+        """Forces a dependency error if the given model is not yet built, so
+           that the current setter does not build until the forced dependency
+           does."""
+        if not model._is_built:
+            raise DependencyError(f"Forced dependency: Model is not yet built")
 
     @classmethod
     def static_size(cls) -> int:
-        return 0
+        """Attempts to get the size of this class, provided all its attributes
+           have a statically-known size."""
 
-    def to_bytes(self) -> bytes:
-        return bytes(0)
+        return sum(item.size() for item in cls._fields().values())
+        
 
-    def _validate(self) -> None:
-        pass
+class Array[T: DatatypeBase](Container[Sequence[T]]):
+    """Datatype for an array of other datatypes. If known, the item count can
+       optionally be specified. This object supports len() but does not
+       otherwise behave like a Python list type. Use get_items() to get a list
+       of items."""
 
-    def __bool__(self) -> bool:
-        return False
+    _model: T | None
+    _item_count: int | None
+    _items: list[T]
 
+    def __init__(self, model: T | None = None, item_count: int | None = None, *, default: Sequence[T] | None = None) -> None:
+        self._model = model
+        self._item_count = item_count
+        self._items = []
+        super().__init__(default=default)
 
-class _Missing(DataType):
-
-    def _get_data(self) -> Any:
-        raise DataMissingError("Attempted to get data of an uninitialized object")
-
-    @classmethod
-    def size(cls) -> int:
-        raise DataMissingError("Attempted to get size of an uninitialized object")
-
-    def to_bytes(self) -> bytes:
-        raise DataMissingError("Attempted to get bytes of an uninitialized object")
-
-    def _validate(self) -> None:
-        pass
-
-    def __bool__(self) -> bool:
-        return False
-
-
-class Align[T: _Primitive](Bytes):
-    '''The data alignment datatype.
-
-    Properties of type `Align` cannot be set directly via setter method or
-    data. Instead, an `Align` datatype will produce the amount of padding bytes
-    needed for the data structure to reach the desired byte alignment. For
-    example, `Align[U32]` will align the data to the next 4-byte boundary.'''
-
-    def __init__(self, parent: Optional[Block], pad_amount: int) -> None:
-        super().__init__(parent, bytes(pad_amount))
-
-
-class Block(DataType):
-    '''The base class of custom datatypes and the foundational building block
-    of BAF.
-
-    Custom datatypes deriving from `Block` can specify their data using member
-    variable annotations, which are then automatically set using data from the
-    `dict` provided in instantiation. Setter methods can also be used instead
-    of populating data directly from the `dict`.'''
-
-    _current_item: _BlockItem
-    root_path: Optional[Path]
-
-    def __init__(self, parent: Optional[Block], data: Optional[Any] = None) -> None:
-        self.size = self._size
-        self.offset_of = self._offset_of
-        self.root_path = None
-        if data and '_root_path' in data:
-            self.root_path = data['_root_path']
-        elif parent is not None and hasattr(parent, 'root_path'):
-            self.root_path = parent.root_path
-        super().__init__(parent)
-        try:
-            self._build(data)
-        except BuildError as e:
-            if hasattr(self, '_current_item'):
-                type_name = self.type_name()
-                prop_name = self._current_item.name
-                prop_type = self._current_item.datatype.__name__
-                if prop_name:
-                    prop_name = f' -> {prop_name}: {prop_type}'
-                e.add_note(f'{type_name}{prop_name}')
-            if self.parent is not None:
-                raise
-            raise
-
-    def _build(self, data: Optional[Any]) -> None:
-        annotations = inspect.get_annotations(type(self), eval_str=True)
-        blockitems: dict[str, _BlockItem] = {}
-        for name, datatype in annotations.items():
-            if name in RESERVED_NAMES:
-                raise BuildError(f"Name '{name}' is reserved and cannot be used as a property name")
-            value = getattr(self, name, None)
-            if value is None:
-                setattr(self, name, _Missing(self))
-            blockitem = _BlockItem(self, name, datatype, value)
-            blockitems[name] = blockitem
-        for item in blockitems.values():
-            item.set_dependencies(blockitems)
-        while any(not item.done for item in blockitems.values()):
-            success = False
-            for name, item in blockitems.items():
-                if item.done:
-                    continue
-                if any(not d.done for d in item.dependencies):
-                    continue
-                self._current_item = item
-                item.build(data)
-                success = True
-                setattr(self, item.name, item.value)
-            if not success:
-                failed = [item.name for item in blockitems.values() if not item.done]
-                raise BuildError(("Couldn't build all items. Check for circular "
-                "dependencies in these properties of "
-                f"{type(self).__name__}:\n{failed}"))
-
-    def _get_data(self) -> Sequence[DataType]:
-        data = []
-        for name in inspect.get_annotations(type(self), eval_str=True):
-            data.append(getattr(self, name))
+    def _preprocess(self, data) -> Sequence:
+        if self._model is None:
+            if self._generic_type is None:
+                raise SpecError("Array has no valid type argument")
+            self._model = self._generic_type()
+        if not isinstance(self._model, DatatypeBase):
+            raise SpecError(f"Array type {type(self._model).__name__} is not a Datatype")
+        if not isinstance(data, Sequence):
+            raise ValidationError(f"Expected Sequence type, received {type(data).__name__}")
+        if self._item_count is None:
+            self._item_count = len(data)
+            return data
+        if self._item_count < 0:
+            raise SpecError("Array item count cannot be less than 0")
+        if len(data) != self._item_count:
+            raise ValidationError(f"Expected {self._item_count} items, received {len(data)}")
         return data
 
-    @classmethod
-    def size(cls) -> int:
-        return sum(datatype.size() for datatype in inspect.get_annotations(cls, eval_str=True).values())
+    def _process(self, data: Sequence) -> None:
+        if self._model is None:
+            raise InternalError("Array still has no inferred type in _process()")
+        items = []
+        for i, data_item in enumerate(data):
+            # Check if passing in an already-built item
+            if isinstance(data_item, type(self._model)):
+                items.append(data_item)
+                continue
+            model, data_item = self._unpack_type(self._model, data_item)
+            item = model.instantiate(self)
+            items.append(item)
+            try:
+                item.build(data_item)
+            except Exception as e:
+                e.add_note(f'Array[{type(self._model).__name__}] -> (element {i})')
+                raise
+        self._items = items
 
-    def _size(self) -> int:
-        size = 0
-        for name, datatype in inspect.get_annotations(type(self), eval_str=True).items():
-            attr = getattr(self, name, datatype)
-            if type(attr) is _Missing:
-                attr = datatype
-            size += attr.size()
-        return size
+    def get_items(self, default_if_missing: bool = False) -> list[T]:
+        items = [item for item in self._items]
+        if self._item_count is None and not items:
+            raise DependencyError("Cannot get items of un-built Array with unknown size")
+        if self._item_count is None:
+            return items
+        items_left = self._item_count - len(items)
+        if items_left > 0 and not default_if_missing:
+            raise DependencyError("Array is not finished building")
+        if self._model is None:
+            raise InternalError("Array still has no inferred type in get_items()")
+        return items + [self._model.instantiate(self)] * items_left
 
-    def to_bytes(self) -> bytes:
-        return b''.join(d.to_bytes() for d in self._get_data())
-
-    def _validate(self) -> None:
-        pass
-
-    def _offset_of(self, prop_name: str) -> int:
-        offset = 0
-        annotations = inspect.get_annotations(type(self), eval_str=True)
-        if not prop_name in annotations:
-            raise BuildError(f"Property name '{prop_name}' does not exist in {type(self).__name__}")
-        for name, datatype in annotations.items():
-            if name == prop_name:
-                return offset
-            attr = getattr(self, name, datatype)
-            if type(attr) is _Missing:
-                attr = datatype
-            offset += attr.size()
-        raise ValueError(f"Property name {prop_name} does not exist in {self.type_name()}")
-
-    @classmethod
-    def offset_of(cls, prop_name: str) -> int:
-        '''Gets the offset (in bytes) of the given property name. This works as
-        both a class method (for statically-known offsets) and as an instance
-        method, as long as all preceding properties have a statically-known
-        size or have already been populated with their data.
-
-        It's preferable to directly call `offset()` on the child object,
-        especially in a setter method, because BAF can figure out the
-        dependencies needed before the offset is calculated. However, this
-        method can be useful in edge cases where `offset()` doesn't work.'''
-
-        offset = 0
-        annotations = inspect.get_annotations(cls, eval_str=True)
-        if not prop_name in annotations:
-            raise BuildError(f"Property name '{prop_name}' does not exist in {cls.__name__}")
-        for name, datatype in annotations.items():
-            if name == prop_name:
-                return offset
-            offset += datatype.size()
-        return offset
+    def __len__(self) -> int:
+        if self._item_count is not None:
+            return self._item_count
+        return len(self.get_items(True))
 
 
-class _BlockItem:
-    done: bool = False
-    owner: Block
-    offset: Optional[int] = None
-    name: str
-    datatype: type
-    argtype: Optional[type] = None
-    value: DataType
-    setter: Optional[Callable]
-    dependencies: list[_BlockItem]
+class Optional[T: Datatype](DatatypeBase):
+    """A wrapper for any Datatype that denotes it as optional. If no data is
+       provided to build the datum, it will have a size and output of 0 bytes
+       instead of failing.
+       Supports __bool__(), i.e. this object is treated as True if it has
+       been confirmed to receive data, and False if it has resolved to not
+       receive data."""
 
-    def __init__(self, owner: Block, name: str, datatype: type, value: Optional[DataType]) -> None:
-        self.owner = owner
-        self.name = name
-        if value is not None:
-            self.value = value
-            self.done = True
-        if hasattr(datatype, '__name__') and datatype.__name__ in ['Align', 'Array']:
-            self.datatype = datatype.__origin__
-            self.argtype = datatype.__args__[0]
-        else:
-            self.datatype = datatype
-        self.setter = getattr(self.owner, 'set_' + name, None)
+    _item: T | None = None
+    model: T
 
-    def set_dependencies(self, items: dict[str, _BlockItem]) -> None:
-        '''Populates self.dependencies with all of the BlockItems this one
-        depends on in order to successfully build.'''
+    def __init__(self, model: T) -> None:
+        self.model = model
+        super().__init__()
 
-        if self.datatype is Align:
-            self.dependencies = self._get_align_dependencies(items)
+    def _build(self, data: Any | None) -> None:
+        self._preprocess(data)
+        if data is None or isinstance(data, Sequence) and len(data) == 0:
             return
-        if self.setter is None:
-            self.dependencies = []
-            return
-        deps = []
-        closures = inspect.getclosurevars(self.setter).unbound
-        if 'offset' in closures or 'offset_of' in closures:
-            deps += self._get_offset_dependencies(self.setter, items)
-        dep_names = [c for c in closures if c in items]
-        for name in items:
-            if name in dep_names and not items[name] in deps:
-                deps.append(items[name])
-        # Check if self-dependency is just offset()
-        if self in deps and self.setter:
-            source = inspect.getsource(self.setter)
-            offset_hits = source.count(f'self.{self.name}.offset()')
-            total_hits = source.count(f'self.{self.name}')
-            if offset_hits == total_hits:
-                deps.remove(self)
-            else:
-                raise Exception(f"Setter {self.setter.__name__} in {type(self.owner).__name__} is trying to access itself")
-        self.dependencies = deps
+        item = self.model.instantiate(self.parent)
+        item.build(data)
+        self._item = item
 
-    def build(self, data: Optional[dict]) -> None:
-        if self.setter:
-            value = self.setter(data)
-        elif data and self.name in data:
-            value = data[self.name]
-        elif self.datatype is Align and self.argtype:
-            if not hasattr(self.argtype, 'static_size'):
-                raise BuildError(f"Align argument must be a primitive type with a statically-known size")
-            alignment = self.argtype.static_size()
-            offset_mod = (self.owner.offset_of(self.name) - 1) % alignment + 1
-            pad_needed = alignment - offset_mod
-            value = Align(self.owner, pad_needed)
-        else:
-            raise DataMissingError(f"No setter or dict value found for {self.name}")
-        self.value = self._ensure_value_wrapped(value)
-        self.done = True
+    def _preprocess(self, _) -> None:
+        if not isinstance(self.model, Datatype):
+            raise SpecError(f"Optional must wrap a known Datatype but received {type(self.model).__name__}")
 
-    def _get_align_dependencies(self, items: dict[str, _BlockItem]) -> list[_BlockItem]:
-        deps = []
-        owner_props = list(inspect.get_annotations(type(self.owner)))
-        for prop in owner_props:
-            if prop == self.name:
-                break
-            if not hasattr(items[prop].datatype, 'static_size'):
-                deps.append(items[prop])
-        return deps
+    def size(self) -> int:
+        if not self._is_built:
+            raise DependencyError("Cannot get size of Optional before it's built")
+        return self._item.size() if self._item else 0
 
+    def _get_bytes(self) -> bytes:
+        return self._item.get_bytes() if self._item else bytes(0)
 
-    def _get_offset_dependencies(self, setter: Callable, items: dict[str, _BlockItem]) -> list[_BlockItem]:
-        source = inspect.getsource(setter)
-        dep_names = []
-        called_props = re.findall(r'self\.(.+?).offset\(\)', source)
-        called_props += re.findall(r'self\.offset_of\([\'|"](.+?)[\'|"]\)', source)
-        owner_props = list(inspect.get_annotations(type(self.owner)))
-        for prop in called_props:
-            prop_index = owner_props.index(prop)
-            dep_names += owner_props[0:prop_index]
-        return [items[dep] for dep in set(dep_names) if not hasattr(items[dep].datatype, 'static_size')]
-
-    def _ensure_value_wrapped(self, value: Any) -> DataType:
-        if type(value) is self.datatype:
-            return value
-        if type(self.datatype) is UnionType:
-            if type(value) in self.datatype.__args__:
-                return value
-            else:
-                raise TypeError("Can't implicity wrap value into a Union type")
-        if self.datatype is Array:
-            return self.datatype(self.owner, self.argtype, value)
-        return self.datatype(self.owner, value)
-
-
-class Array[T: DataType](Block, list[T]):
-    '''A raw array of items in the specified type.'''
-
-    def __init__(self, parent: Optional[Block], datatype: Optional[type] = None, data: list = []) -> None:
-        self.size = self._size
-        self._data = data
-        super().__init__(parent)
-        if datatype:
-            for item in data:
-                try:
-                    self.append(datatype(self, item))
-                except BuildError as e:
-                    prop_name = f'Array[{datatype.__name__}]'
-                    prop_name += f' -> (element {len(self)})'
-                    e.add_note(prop_name)
-                    raise
-
-    def _get_data(self) -> Sequence[DataType]:
-        return self
-
-    @classmethod
-    def size(cls) -> int:
-        raise DataMissingError("Attempted to get size of an Array before it was initialized")
-
-    def _size(self) -> int:
-        return sum(d.size() for d in self)
-
-    def to_bytes(self) -> bytes:
-        return b''.join(d.to_bytes() for d in self)
-
-    def _validate(self) -> None:
-        if not isinstance(self._data, Iterable):
-            type_name = type(self._data).__name__
-            raise ValidationError(f"Expected iterable type, received {type_name}")
-
-    # Although this extends list, it should absolutely not return False
-    # if empty, because Array is much more Blocky than listy
     def __bool__(self) -> bool:
-        return True
+        if not self._is_built:
+            raise DependencyError("Optional is ambiguous until it is built")
+        return self._item is not None
+
+
+class Align(GenDatatype):
+    """A datatype that generates the amount of padding needed to align the
+       parent container to a specific byte count. For example, Align(2) will
+       add padding to give the data 16-bit alignment at that point. If the data
+       is already aligned, no padding will be added, and this object will have
+       a size and output of 0 bytes."""
+
+    _align_size: int
+    _pad_amount: int | None = None
+
+    def __init__(self, align_size: int | DatatypeBase) -> None:
+        if isinstance(align_size, DatatypeBase):
+            self._align_size = align_size.size()
+        else:
+            self._align_size = align_size
+
+    def _preprocess(self) -> None:
+        if self._align_size < 2:
+            raise SpecError("Align size must be at least 2")
+
+    def _process(self) -> None:
+        self._pad_amount = self.size()
+
+    def _get_bytes(self) -> bytes:
+        if self._pad_amount is None:
+            raise BuildError("Cannot get bytes before having been built")
+        return bytes(self._pad_amount)
+
+    def size(self) -> int:
+        align = self._align_size
+        pad_amount = (align - self.offset() % align) % align
+        return pad_amount
